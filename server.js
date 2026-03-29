@@ -11,6 +11,15 @@ const JWT_SECRET = 'cellinspector_secret_key_2024';
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 initDatabase();
+app.use(cors());
+app.use(express.json({ limit: '50mb' }));
+
+initDatabase();
+
+// ✅ ADD HERE
+app.get('/', (req, res) => {
+  res.send('CellInspector Server is running 🚀');
+});
 
 function verifyToken(req, res, next) {
   const token = req.headers['authorization'];
