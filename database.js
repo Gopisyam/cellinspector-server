@@ -17,8 +17,7 @@ function initDatabase() {
 
   db.exec(`CREATE TABLE IF NOT EXISTS inspections (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    cell_id TEXT NOT NULL,
-    cell_type TEXT DEFAULT 'VRLA',
+    cell_id TEXT NOT NULL, cell_type TEXT DEFAULT 'VRLA',
     rated_voltage REAL, rated_capacity REAL,
     voltage REAL DEFAULT 0, capacity REAL DEFAULT 0,
     resistance REAL DEFAULT 0, temperature REAL DEFAULT 0,
@@ -41,25 +40,30 @@ function initDatabase() {
     lvbd_min REAL DEFAULT 42,
     dod_caution REAL DEFAULT 80,
     dod_deploy_bb REAL DEFAULT 80,
+    float_tolerance REAL DEFAULT 0.1,
+    boost_tolerance REAL DEFAULT 0.1,
     updated_at TEXT DEFAULT (datetime('now'))
   )`);
 
   db.exec(`CREATE TABLE IF NOT EXISTS notifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT DEFAULT 'Notice',
-    message TEXT NOT NULL,
-    sent_by TEXT,
-    sent_by_name TEXT,
+    title TEXT DEFAULT 'Notice', message TEXT NOT NULL,
+    sent_by TEXT, sent_by_name TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   )`);
 
-  // Migrations
-  ['permissions TEXT DEFAULT "{}"'].forEach(col => {
-    try { db.exec(`ALTER TABLE engineers ADD COLUMN ${col}`); } catch(e) {}
-  });
-  ['float_voltage_max REAL DEFAULT 54.4','boost_voltage_max REAL DEFAULT 55.6',
-   'lvbd_min REAL DEFAULT 42','dod_caution REAL DEFAULT 80','dod_deploy_bb REAL DEFAULT 80'
-  ].forEach(col => { try { db.exec(`ALTER TABLE thresholds ADD COLUMN ${col}`); } catch(e) {} });
+  // Migrations — safe to run on existing DB
+  const migrations = [
+    `ALTER TABLE engineers ADD COLUMN permissions TEXT DEFAULT '{}'`,
+    `ALTER TABLE thresholds ADD COLUMN float_voltage_max REAL DEFAULT 54.4`,
+    `ALTER TABLE thresholds ADD COLUMN boost_voltage_max REAL DEFAULT 55.6`,
+    `ALTER TABLE thresholds ADD COLUMN lvbd_min REAL DEFAULT 42`,
+    `ALTER TABLE thresholds ADD COLUMN dod_caution REAL DEFAULT 80`,
+    `ALTER TABLE thresholds ADD COLUMN dod_deploy_bb REAL DEFAULT 80`,
+    `ALTER TABLE thresholds ADD COLUMN float_tolerance REAL DEFAULT 0.1`,
+    `ALTER TABLE thresholds ADD COLUMN boost_tolerance REAL DEFAULT 0.1`,
+  ];
+  migrations.forEach(sql => { try { db.exec(sql); } catch(e) {} });
 
   // Seed VRLA threshold
   if (!db.prepare('SELECT id FROM thresholds WHERE cell_type=?').get('VRLA'))
@@ -74,7 +78,7 @@ function initDatabase() {
           adjust_thresholds:true, delete_inspections:true, edit_inspections:true,
           send_notifications:true, view_thresholds:true
         }));
-    console.log('Superadmin: SUPERADMIN / super123');
+    console.log('SuperAdmin created: SUPERADMIN / super123');
   }
 
   // Seed admin
@@ -86,7 +90,7 @@ function initDatabase() {
           adjust_thresholds:false, delete_inspections:false, edit_inspections:false,
           send_notifications:false, view_thresholds:true
         }));
-    console.log('Admin: ADMIN001 / admin123');
+    console.log('Admin created: ADMIN001 / admin123');
   }
 }
 

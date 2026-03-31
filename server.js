@@ -11,15 +11,6 @@ const JWT_SECRET = 'cellinspector_secret_key_2024';
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 initDatabase();
-app.use(cors());
-app.use(express.json({ limit: '50mb' }));
-
-initDatabase();
-
-// ✅ ADD HERE
-app.get('/', (req, res) => {
-  res.send('CellInspector Server is running 🚀');
-});
 
 function verifyToken(req, res, next) {
   const token = req.headers['authorization'];
@@ -58,6 +49,36 @@ app.post('/login', (req, res) => {
     id: eng.id, employee_id: eng.employee_id,
     name: eng.name, role: eng.role, permissions: perms
   }});
+});
+
+// ── CHANGE OWN PASSWORD (any logged-in user) ──────────
+app.post('/change-password', verifyToken, (req, res) => {
+  const { current_password, new_password } = req.body;
+  if (!current_password || !new_password)
+    return res.status(400).json({ error: 'Both current and new password required' });
+  if (new_password.length < 4)
+    return res.status(400).json({ error: 'New password must be at least 4 characters' });
+  const eng = db.prepare('SELECT * FROM engineers WHERE employee_id = ?').get(req.user.employee_id);
+  if (!eng) return res.status(404).json({ error: 'User not found' });
+  if (!bcrypt.compareSync(current_password, eng.password))
+    return res.status(401).json({ error: 'Current password is incorrect' });
+  db.prepare('UPDATE engineers SET password = ? WHERE employee_id = ?')
+    .run(bcrypt.hashSync(new_password, 10), req.user.employee_id);
+  res.json({ success: true });
+});
+
+// ── RESET PASSWORD (superadmin only, no current password needed) ──
+app.post('/reset-password/:id', verifyToken, (req, res) => {
+  if (req.user.role !== 'superadmin')
+    return res.status(403).json({ error: 'SuperAdmin only' });
+  const { new_password } = req.body;
+  if (!new_password || new_password.length < 4)
+    return res.status(400).json({ error: 'New password must be at least 4 characters' });
+  const eng = db.prepare('SELECT * FROM engineers WHERE id = ?').get(req.params.id);
+  if (!eng) return res.status(404).json({ error: 'User not found' });
+  db.prepare('UPDATE engineers SET password = ? WHERE id = ?')
+    .run(bcrypt.hashSync(new_password, 10), req.params.id);
+  res.json({ success: true });
 });
 
 // ── INSPECTIONS ────────────────────────────────────────
@@ -103,7 +124,8 @@ app.put('/inspections/:id', verifyToken, (req, res) => {
 
 app.delete('/inspections/:id', verifyToken, (req, res) => {
   const perms = getPerms(req.user.employee_id);
-  const allowed = req.user.role==='superadmin' || req.user.role==='admin' && perms.delete_inspections;
+  const allowed = req.user.role==='superadmin' ||
+    (req.user.role==='admin' && perms.delete_inspections);
   if (!allowed) return res.status(403).json({ error: 'Permission denied' });
   db.prepare('DELETE FROM inspections WHERE id=?').run(req.params.id);
   res.json({ success: true });
@@ -138,11 +160,13 @@ app.put('/thresholds/:cell_type', verifyToken, (req, res) => {
     res_accept=?,res_replace=?,temp_min=?,temp_max=?,
     cycle_accept=?,cycle_replace=?,float_voltage_max=?,
     boost_voltage_max=?,lvbd_min=?,dod_caution=?,dod_deploy_bb=?,
+    float_tolerance=?,boost_tolerance=?,
     updated_at=datetime('now') WHERE cell_type=?`).run(
     t.volt_accept,t.volt_replace,t.cap_accept,t.cap_replace,
     t.res_accept,t.res_replace,t.temp_min,t.temp_max,
     t.cycle_accept,t.cycle_replace,t.float_voltage_max,
     t.boost_voltage_max,t.lvbd_min,t.dod_caution,t.dod_deploy_bb,
+    t.float_tolerance??0.1, t.boost_tolerance??0.1,
     req.params.cell_type);
   res.json({ success: true });
 });
@@ -159,26 +183,14 @@ app.post('/engineers', verifyToken, (req, res) => {
   const perms = getPerms(req.user.employee_id);
   const isSuperAdmin = req.user.role === 'superadmin';
   const isAdmin = req.user.role === 'admin';
-
-  if (!isSuperAdmin && !isAdmin)
-    return res.status(403).json({ error: 'Access denied' });
-  if (isAdmin && !perms.add_users)
-    return res.status(403).json({ error: 'Add user permission not granted' });
-
+  if (!isSuperAdmin && !isAdmin) return res.status(403).json({ error: 'Access denied' });
+  if (isAdmin && !perms.add_users) return res.status(403).json({ error: 'Add user permission not granted' });
   const { employee_id, name, password, role, permissions } = req.body;
-  if (!employee_id || !name || !password)
-    return res.status(400).json({ error: 'All fields required' });
-
-  // SuperAdmin can add admin or engineer only (not another superadmin)
-  if (role === 'superadmin')
-    return res.status(403).json({ error: 'Cannot create a superadmin account' });
-  // Admin can ONLY add engineers - never admin
-  if (isAdmin && role !== 'engineer')
-    return res.status(403).json({ error: 'Admin can only add engineers, not admins' });
-
+  if (!employee_id || !name || !password) return res.status(400).json({ error: 'All fields required' });
+  if (role === 'superadmin') return res.status(403).json({ error: 'Cannot create superadmin' });
+  if (isAdmin && role !== 'engineer') return res.status(403).json({ error: 'Admin can only add engineers' });
   const existing = db.prepare('SELECT id FROM engineers WHERE employee_id=?').get(employee_id);
   if (existing) return res.status(400).json({ error: 'Employee ID already exists' });
-
   const hashed = bcrypt.hashSync(password, 10);
   db.prepare('INSERT INTO engineers (employee_id,name,password,role,permissions) VALUES (?,?,?,?,?)')
     .run(employee_id, name, hashed, role||'engineer', JSON.stringify(permissions||{}));
@@ -192,15 +204,13 @@ app.put('/engineers/:id', verifyToken, (req, res) => {
   if (!isSuperAdmin && !(isAdmin && perms.edit_users))
     return res.status(403).json({ error: 'Edit permission not granted' });
   const { name, password, role, permissions } = req.body;
-  if (isAdmin && role === 'admin')
-    return res.status(403).json({ error: 'Admin cannot promote to admin role' });
-  const payload = [name, role, JSON.stringify(permissions||{})];
+  if (isAdmin && role === 'admin') return res.status(403).json({ error: 'Admin cannot promote to admin' });
   if (password) {
     db.prepare('UPDATE engineers SET name=?,role=?,permissions=?,password=? WHERE id=?')
-      .run(...payload, bcrypt.hashSync(password,10), req.params.id);
+      .run(name, role, JSON.stringify(permissions||{}), bcrypt.hashSync(password,10), req.params.id);
   } else {
     db.prepare('UPDATE engineers SET name=?,role=?,permissions=? WHERE id=?')
-      .run(...payload, req.params.id);
+      .run(name, role, JSON.stringify(permissions||{}), req.params.id);
   }
   res.json({ success: true });
 });
@@ -237,7 +247,7 @@ app.post('/notifications', verifyToken, (req, res) => {
 });
 
 app.delete('/notifications/:id', verifyToken, (req, res) => {
-  if (req.user.role !== 'superadmin') return res.status(403).json({ error: 'Superadmin only' });
+  if (req.user.role !== 'superadmin') return res.status(403).json({ error: 'SuperAdmin only' });
   db.prepare('DELETE FROM notifications WHERE id=?').run(req.params.id);
   res.json({ success: true });
 });
@@ -271,5 +281,5 @@ app.get('/health', (req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`CellInspector Server running on port ${PORT}`);
-  console.log(`Test: http://localhost:${PORT}/health`);
+  console.log(`Health: http://localhost:${PORT}/health`);
 });
