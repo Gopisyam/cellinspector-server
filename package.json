@@ -1,0 +1,24 @@
+{
+  "name": "cellinspectorserver",
+  "version": "2.0.0",
+  "description": "HBL Cell Inspector Server — PostgreSQL edition",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [],
+  "author": "HBL Engineering Limited",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "pg": "^8.13.3"
+  }
+}
