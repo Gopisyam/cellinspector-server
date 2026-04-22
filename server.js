@@ -85,6 +85,10 @@ async function initDatabase() {
     `ALTER TABLE engineers ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '{}'`,
     `ALTER TABLE engineers ADD COLUMN IF NOT EXISTS circle TEXT DEFAULT ''`,
     `ALTER TABLE inspections ADD COLUMN IF NOT EXISTS circle TEXT DEFAULT ''`,
+    `ALTER TABLE engineers ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ`,
+    `ALTER TABLE engineers ADD COLUMN IF NOT EXISTS app_version TEXT DEFAULT ''`,
+    `ALTER TABLE engineers ADD COLUMN IF NOT EXISTS device_platform TEXT DEFAULT ''`,
+    `ALTER TABLE engineers ADD COLUMN IF NOT EXISTS login_count INTEGER DEFAULT 0`,
     `CREATE TABLE IF NOT EXISTS engineer_admin_map (
       id SERIAL PRIMARY KEY,
       engineer_employee_id TEXT NOT NULL,
@@ -152,6 +156,15 @@ app.post('/login', async (req,res) => {
     const token = jwt.sign(
       {id:eng.id,employee_id:eng.employee_id,name:eng.name,role:eng.role,circle:eng.circle||''},
       JWT_SECRET,{expiresIn:'30d'});
+    // Track last login, app version, device info
+    const { app_version='', device_platform='' } = req.body;
+    await q(`UPDATE engineers SET
+      last_login=NOW(),
+      login_count=COALESCE(login_count,0)+1,
+      app_version=$1,
+      device_platform=$2
+      WHERE id=$3`,
+      [app_version||'', device_platform||'', eng.id]);
     res.json({token, engineer:{
       id:eng.id, employee_id:eng.employee_id, name:eng.name,
       role:eng.role, circle:eng.circle||'', permissions:eng.permissions||{}
@@ -217,18 +230,45 @@ app.get('/inspections', verifyToken, async (req,res) => {
         r = await q('SELECT * FROM inspections ORDER BY created_at DESC');
       }
     } else if (role==='admin') {
-      // Admin sees records from their circle AND from directly mapped engineers
+      // Admin sees records from:
+      // 1. Their own circle
+      // 2. Directly mapped engineers (by employee_id)
+      // 3. Engineers under mapped admins (admin→admin mapping)
       const mappedRes = await q(
         'SELECT engineer_employee_id FROM engineer_admin_map WHERE admin_employee_id=$1',
         [employee_id]
       );
-      const mappedIds = mappedRes.rows.map(row => row.engineer_employee_id);
-      if (mappedIds.length > 0) {
-        // Show circle records + specifically mapped engineer records
-        const placeholders = mappedIds.map((_,i) => `$${i+2}`).join(',');
+      const directMappedIds = mappedRes.rows.map(row => row.engineer_employee_id);
+
+      // Find any mapped admin IDs, then get their engineers too
+      const mappedAdminIds = directMappedIds.filter(async id => {
+        const er = await q('SELECT role FROM engineers WHERE employee_id=$1',[id]);
+        return er.rows[0]?.role === 'admin';
+      });
+      // Simpler: get all circles of mapped admins and include those too
+      let allMappedIds = [...directMappedIds];
+      if (directMappedIds.length > 0) {
+        const mappedAdminsRes = await q(
+          `SELECT e2.employee_id FROM engineers e2
+           WHERE e2.employee_id = ANY($1::text[]) AND e2.role = 'admin'`,
+          [directMappedIds]
+        );
+        for (const adminRow of mappedAdminsRes.rows) {
+          // Get all engineers under each mapped admin (same circle)
+          const adminInfo = await q('SELECT circle FROM engineers WHERE employee_id=$1',[adminRow.employee_id]);
+          if (adminInfo.rows[0]?.circle) {
+            const engRes = await q('SELECT employee_id FROM engineers WHERE circle=$1 AND role=$2',[adminInfo.rows[0].circle,'engineer']);
+            allMappedIds = [...allMappedIds, ...engRes.rows.map(r=>r.employee_id)];
+          }
+        }
+      }
+      allMappedIds = [...new Set(allMappedIds)]; // deduplicate
+
+      if (allMappedIds.length > 0) {
+        const placeholders = allMappedIds.map((_,i) => `$${i+2}`).join(',');
         r = await q(
           `SELECT * FROM inspections WHERE circle=$1 OR engineer_id IN (${placeholders}) ORDER BY created_at DESC`,
-          [circle||'', ...mappedIds]
+          [circle||'', ...allMappedIds]
         );
       } else {
         r = await q('SELECT * FROM inspections WHERE circle=$1 ORDER BY created_at DESC',[circle||'']);
@@ -349,11 +389,11 @@ app.get('/engineers', verifyToken, async (req,res) => {
       // SuperAdmin sees all engineers, optionally filtered by circle
       const filterCircle = req.query.circle;
       r = filterCircle
-        ? await q('SELECT id,employee_id,name,role,circle,permissions,created_at FROM engineers WHERE circle=$1 ORDER BY role,name',[filterCircle])
-        : await q('SELECT id,employee_id,name,role,circle,permissions,created_at FROM engineers ORDER BY role,name');
+        ? await q('SELECT id,employee_id,name,role,circle,permissions,created_at,last_login,app_version,device_platform,login_count FROM engineers WHERE circle=$1 ORDER BY role,name',[filterCircle])
+        : await q('SELECT id,employee_id,name,role,circle,permissions,created_at,last_login,app_version,device_platform,login_count FROM engineers ORDER BY role,name');
     } else {
       // Admin sees engineers in their own circle only
-      r = await q('SELECT id,employee_id,name,role,circle,permissions,created_at FROM engineers WHERE circle=$1 ORDER BY role,name',[req.user.circle||'']);
+      r = await q('SELECT id,employee_id,name,role,circle,permissions,created_at,last_login,app_version,device_platform,login_count FROM engineers WHERE circle=$1 ORDER BY role,name',[req.user.circle||'']);
     }
     res.json(r.rows);
   } catch(e){res.status(500).json({error:e.message});}
@@ -471,6 +511,7 @@ app.get('/admin-mappings/:admin_id', verifyToken, async (req,res) => {
   try {
     if (!['superadmin','admin'].includes(req.user.role))
       return res.status(403).json({error:'Access denied'});
+    // Returns all mapped user IDs (both engineers and admins)
     const r = await q('SELECT engineer_employee_id FROM engineer_admin_map WHERE admin_employee_id=$1',[req.params.admin_id]);
     res.json(r.rows.map(row => row.engineer_employee_id));
   } catch(e){res.status(500).json({error:e.message});}
