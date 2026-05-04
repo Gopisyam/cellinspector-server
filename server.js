@@ -12,7 +12,7 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: "postgresql://postgres.sszokapwixgpysralszx:[Gopisyam@1955]@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres",
   ssl: { rejectUnauthorized: false },
 });
 const q = (text, params) => pool.query(text, params);
