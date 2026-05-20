@@ -422,13 +422,71 @@ app.post('/engineers', verifyToken, async (req,res) => {
     const assignedCircle = isA ? (req.user.circle||'') : (circle||'');
     const ex = await q('SELECT id FROM engineers WHERE employee_id=$1',[employee_id]);
     if (ex.rows.length) return res.status(400).json({error:'Employee ID already exists'});
-    await q('INSERT INTO engineers (employee_id,name,password,role,circle,permissions) VALUES ($1,$2,$3,$4,$5,$6)',
-      // FIX#2: normalise permissions on create
-      let newPerms = permissions||{};
-      if (typeof newPerms === 'string') { try { newPerms = JSON.parse(newPerms); } catch(e) { newPerms = {}; } }
-      const newPermsJson = JSON.stringify(newPerms);
-    await q('INSERT INTO engineers (employee_id,name,password,role,circle,permissions) VALUES ($1,$2,$3,$4,$5,$6)',
-      [employee_id,name,bcrypt.hashSync(password,10),role||'engineer',assignedCircle,newPermsJson]);
+    app.post('/engineers', verifyToken, async (req,res) => {
+  try {
+    const perms = await getPerms(req.user.employee_id);
+    const isSA = req.user.role === 'superadmin',
+          isA  = req.user.role === 'admin';
+
+    if (!isSA && !isA)
+      return res.status(403).json({error:'Access denied'});
+
+    if (isA && !perms.add_users)
+      return res.status(403).json({error:'Add user permission not granted'});
+
+    const {employee_id,name,password,role,circle,permissions} = req.body;
+
+    if (!employee_id || !name || !password)
+      return res.status(400).json({error:'All fields required'});
+
+    if (role === 'superadmin')
+      return res.status(403).json({error:'Cannot create superadmin'});
+
+    if (isA && role !== 'engineer')
+      return res.status(403).json({error:'Admin can only add engineers'});
+
+    // Admin can only add engineers to their own circle
+    const assignedCircle = isA ? (req.user.circle || '') : (circle || '');
+
+    const ex = await q(
+      'SELECT id FROM engineers WHERE employee_id=$1',
+      [employee_id]
+    );
+
+    if (ex.rows.length)
+      return res.status(400).json({error:'Employee ID already exists'});
+
+    // Normalize permissions
+    let newPerms = permissions || {};
+
+    if (typeof newPerms === 'string') {
+      try {
+        newPerms = JSON.parse(newPerms);
+      } catch(e) {
+        newPerms = {};
+      }
+    }
+
+    const newPermsJson = JSON.stringify(newPerms);
+
+    await q(
+      'INSERT INTO engineers (employee_id,name,password,role,circle,permissions) VALUES ($1,$2,$3,$4,$5,$6)',
+      [
+        employee_id,
+        name,
+        bcrypt.hashSync(password,10),
+        role || 'engineer',
+        assignedCircle,
+        newPermsJson
+      ]
+    );
+
+    res.json({success:true});
+
+  } catch(e){
+    res.status(500).json({error:e.message});
+  }
+});
     res.json({success:true});
   } catch(e){res.status(500).json({error:e.message});}
 });
