@@ -99,6 +99,14 @@ async function initDatabase() {
   ];
   for (const sql of migrations) { try { await q(sql); } catch(e) {} }
 
+  // FIX#3: Backfill — set empty string for users with NULL circle (old records)
+  await q(`UPDATE engineers SET circle='' WHERE circle IS NULL`);
+  // FIX#2: Backfill — set empty permissions object for users with NULL permissions
+  await q(`UPDATE engineers SET permissions='{}' WHERE permissions IS NULL`);
+  // FIX#2: Add new approval permissions to existing superadmin account
+  await q(`UPDATE engineers SET permissions = permissions || '{"approval_level1":true,"approval_level2":true}'
+    WHERE role='superadmin' AND (permissions->>'approval_level1') IS NULL`);
+
   await q(`INSERT INTO thresholds (cell_type) VALUES ('VRLA') ON CONFLICT (cell_type) DO NOTHING`);
 
   const sa = await q(`SELECT id FROM engineers WHERE employee_id=$1`,['SUPERADMIN']);
@@ -108,7 +116,8 @@ async function initDatabase() {
         JSON.stringify({view_calculated:true,add_users:true,edit_users:true,delete_users:true,
           adjust_thresholds:true,delete_inspections:true,edit_inspections:true,
           send_notifications:true,view_thresholds:true,
-          download_excel:true,share_pdf:true})]);
+          download_excel:true,share_pdf:true,
+          approval_level1:true,approval_level2:true})]);
     console.log('SuperAdmin created: SUPERADMIN / super123');
   }
 
@@ -414,7 +423,12 @@ app.post('/engineers', verifyToken, async (req,res) => {
     const ex = await q('SELECT id FROM engineers WHERE employee_id=$1',[employee_id]);
     if (ex.rows.length) return res.status(400).json({error:'Employee ID already exists'});
     await q('INSERT INTO engineers (employee_id,name,password,role,circle,permissions) VALUES ($1,$2,$3,$4,$5,$6)',
-      [employee_id,name,bcrypt.hashSync(password,10),role||'engineer',assignedCircle,JSON.stringify(permissions||{})]);
+      // FIX#2: normalise permissions on create
+      let newPerms = permissions||{};
+      if (typeof newPerms === 'string') { try { newPerms = JSON.parse(newPerms); } catch(e) { newPerms = {}; } }
+      const newPermsJson = JSON.stringify(newPerms);
+    await q('INSERT INTO engineers (employee_id,name,password,role,circle,permissions) VALUES ($1,$2,$3,$4,$5,$6)',
+      [employee_id,name,bcrypt.hashSync(password,10),role||'engineer',assignedCircle,newPermsJson]);
     res.json({success:true});
   } catch(e){res.status(500).json({error:e.message});}
 });
@@ -427,14 +441,18 @@ app.put('/engineers/:id', verifyToken, async (req,res) => {
     const {name,password,role,circle,permissions}=req.body;
     if (isA&&role==='admin') return res.status(403).json({error:'Cannot promote to admin'});
     const assignedCircle = isSA ? (circle||'') : (req.user.circle||'');
-    const update = {name, role, circle:assignedCircle, permissions:JSON.stringify(permissions||{})};
-    if (password) update.password = bcrypt.hashSync(password,10);
+    // FIX#2: normalise permissions — may arrive as object or already-stringified string
+    let permsToSave = permissions||{};
+    if (typeof permsToSave === 'string') {
+      try { permsToSave = JSON.parse(permsToSave); } catch(e) { permsToSave = {}; }
+    }
+    const permsJson = JSON.stringify(permsToSave);
     if (password) {
       await q('UPDATE engineers SET name=$1,role=$2,circle=$3,permissions=$4,password=$5 WHERE id=$6',
-        [name,role,assignedCircle,JSON.stringify(permissions||{}),bcrypt.hashSync(password,10),req.params.id]);
+        [name,role,assignedCircle,permsJson,bcrypt.hashSync(password,10),req.params.id]);
     } else {
       await q('UPDATE engineers SET name=$1,role=$2,circle=$3,permissions=$4 WHERE id=$5',
-        [name,role,assignedCircle,JSON.stringify(permissions||{}),req.params.id]);
+        [name,role,assignedCircle,permsJson,req.params.id]);
     }
     res.json({success:true});
   } catch(e){res.status(500).json({error:e.message});}
@@ -504,9 +522,31 @@ app.post('/sync', verifyToken, async (req,res) => {
 
 app.get('/health',(req,res)=>res.json({status:'ok',version:'1.2.0',message:'HBL CellInspector — PostgreSQL'}));
 
-initDatabase().then(()=>{
-  app.listen(PORT,'0.0.0.0',()=>console.log(`Server running on port ${PORT}`));
-}).catch(e=>{ console.error('DB init failed:',e.message); process.exit(1); });// ── ENGINEER-ADMIN MAPPING ────────────────────────────────────────
+// ── FIX#1: PATCH remarks — used by approval workflow (Level 1 & Level 2 override)
+// Any user with approval_level1 or approval_level2 permission can call this
+app.patch('/inspections/:id/remarks', verifyToken, async (req,res) => {
+  try {
+    const perms = await getPerms(req.user.employee_id);
+    const isSA  = req.user.role === 'superadmin';
+    const canL1 = isSA || perms.approval_level1;
+    const canL2 = isSA || perms.approval_level2;
+    if (!canL1 && !canL2) return res.status(403).json({error:'Approval permission not granted'});
+
+    const { remarks } = req.body;
+    if (!remarks) return res.status(400).json({error:'remarks required'});
+
+    // Parse to validate JSON then store as string
+    let parsed;
+    try { parsed = typeof remarks === 'string' ? JSON.parse(remarks) : remarks; }
+    catch(e) { return res.status(400).json({error:'Invalid JSON in remarks'}); }
+
+    await q('UPDATE inspections SET remarks=$1 WHERE id=$2',
+      [JSON.stringify(parsed), req.params.id]);
+    res.json({success:true});
+  } catch(e){res.status(500).json({error:e.message});}
+});
+
+// ── ENGINEER-ADMIN MAPPING ────────────────────────────────────────
 app.get('/admin-mappings/:admin_id', verifyToken, async (req,res) => {
   try {
     if (!['superadmin','admin'].includes(req.user.role))
@@ -537,4 +577,6 @@ app.get('/my-admin', verifyToken, async (req,res) => {
   } catch(e){res.status(500).json({error:e.message});}
 });
 
-
+initDatabase().then(()=>{
+  app.listen(PORT,'0.0.0.0',()=>console.log(`Server running on port ${PORT}`));
+}).catch(e=>{ console.error('DB init failed:',e.message); process.exit(1); });
