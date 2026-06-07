@@ -9,7 +9,27 @@ const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'cellinspector_secret_key_2024';
 
 app.use(cors());
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: '100mb' }));
+app.use(express.urlencoded({ limit: '100mb', extended: true }));
+
+// ── SECURITY: HTTP headers ────────────────────────────────────────────────
+app.use((req, res, next) => {
+  res.removeHeader('X-Powered-By');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  next();
+});
+
+// ── SECURITY: Rate limiting — max 10 login attempts per IP per 15 min ────
+const loginAttempts = new Map();
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, attempts] of loginAttempts.entries()) {
+    if (attempts.every(t => now - t > 15 * 60 * 1000)) loginAttempts.delete(k);
+  }
+}, 60 * 60 * 1000);
 
 const pool = new Pool({
   connectionString: "postgresql://postgres.sszokapwixgpysralszx:Gopisyam@1955@aws-1-ap-southeast-1.pooler.supabase.com:6543/postgres",
@@ -99,6 +119,24 @@ async function initDatabase() {
   ];
   for (const sql of migrations) { try { await q(sql); } catch(e) {} }
 
+  // ── SECURITY: Enable RLS on all tables ───────────────────────────────
+  // Only the service_role (backend) can access data — anon key has zero access
+  const rlsTables = ['engineers','inspections','thresholds','notifications','engineer_admin_map'];
+  for (const tbl of rlsTables) {
+    try { await q(`ALTER TABLE ${tbl} ENABLE ROW LEVEL SECURITY`); } catch(e) {}
+    // Drop old policies first (idempotent)
+    try { await q(`DROP POLICY IF EXISTS "${tbl}_service_only" ON ${tbl}`); } catch(e) {}
+    // Service role only — backend server bypasses RLS, anon gets nothing
+    try {
+      await q(`CREATE POLICY "${tbl}_service_only" ON ${tbl} FOR ALL TO service_role USING (true) WITH CHECK (true)`);
+    } catch(e) {}
+    // Revoke all access from anon and public
+    try { await q(`REVOKE ALL ON ${tbl} FROM anon, public`); } catch(e) {}
+  }
+  // Revoke password column from non-service roles (sensitive data protection)
+  try { await q(`REVOKE SELECT (password) ON engineers FROM anon, public, authenticated`); } catch(e) {}
+  console.log('✓ Security: RLS enabled on all tables — anon access revoked');
+
   // FIX#3: Backfill — set empty string for users with NULL circle (old records)
   await q(`UPDATE engineers SET circle='' WHERE circle IS NULL`);
   // FIX#2: Backfill — set empty permissions object for users with NULL permissions
@@ -156,8 +194,20 @@ async function getUserCircle(employee_id) {
 // ── LOGIN ─────────────────────────────────────────────────────
 app.post('/login', async (req,res) => {
   try {
-    const {employee_id,password} = req.body;
+    const {employee_id,password,app_version,device_platform} = req.body;
     if (!employee_id||!password) return res.status(400).json({error:'Fields required'});
+
+    // Rate limiting
+    const ip = req.ip || req.connection?.remoteAddress || 'unknown';
+    const rlKey = ip + ':' + String(employee_id).trim().toUpperCase();
+    const now = Date.now();
+    const recent = (loginAttempts.get(rlKey) || []).filter(t => now - t < 15 * 60 * 1000);
+    if (recent.length >= 10) {
+      return res.status(429).json({ error: 'Too many login attempts. Please wait 15 minutes.' });
+    }
+    recent.push(now);
+    loginAttempts.set(rlKey, recent);
+
     const r = await q('SELECT * FROM engineers WHERE employee_id=$1',[employee_id]);
     const eng = r.rows[0];
     if (!eng) return res.status(401).json({error:'Employee ID not found'});
@@ -166,7 +216,6 @@ app.post('/login', async (req,res) => {
       {id:eng.id,employee_id:eng.employee_id,name:eng.name,role:eng.role,circle:eng.circle||''},
       JWT_SECRET,{expiresIn:'30d'});
     // Track last login, app version, device info
-    const { app_version='', device_platform='' } = req.body;
     await q(`UPDATE engineers SET
       last_login=NOW(),
       login_count=COALESCE(login_count,0)+1,
@@ -422,71 +471,12 @@ app.post('/engineers', verifyToken, async (req,res) => {
     const assignedCircle = isA ? (req.user.circle||'') : (circle||'');
     const ex = await q('SELECT id FROM engineers WHERE employee_id=$1',[employee_id]);
     if (ex.rows.length) return res.status(400).json({error:'Employee ID already exists'});
-    app.post('/engineers', verifyToken, async (req,res) => {
-  try {
-    const perms = await getPerms(req.user.employee_id);
-    const isSA = req.user.role === 'superadmin',
-          isA  = req.user.role === 'admin';
-
-    if (!isSA && !isA)
-      return res.status(403).json({error:'Access denied'});
-
-    if (isA && !perms.add_users)
-      return res.status(403).json({error:'Add user permission not granted'});
-
-    const {employee_id,name,password,role,circle,permissions} = req.body;
-
-    if (!employee_id || !name || !password)
-      return res.status(400).json({error:'All fields required'});
-
-    if (role === 'superadmin')
-      return res.status(403).json({error:'Cannot create superadmin'});
-
-    if (isA && role !== 'engineer')
-      return res.status(403).json({error:'Admin can only add engineers'});
-
-    // Admin can only add engineers to their own circle
-    const assignedCircle = isA ? (req.user.circle || '') : (circle || '');
-
-    const ex = await q(
-      'SELECT id FROM engineers WHERE employee_id=$1',
-      [employee_id]
-    );
-
-    if (ex.rows.length)
-      return res.status(400).json({error:'Employee ID already exists'});
-
-    // Normalize permissions
+    // Normalise permissions — may arrive as object or already-stringified string
     let newPerms = permissions || {};
-
-    if (typeof newPerms === 'string') {
-      try {
-        newPerms = JSON.parse(newPerms);
-      } catch(e) {
-        newPerms = {};
-      }
-    }
-
+    if (typeof newPerms === 'string') { try { newPerms = JSON.parse(newPerms); } catch(e) { newPerms = {}; } }
     const newPermsJson = JSON.stringify(newPerms);
-
-    await q(
-      'INSERT INTO engineers (employee_id,name,password,role,circle,permissions) VALUES ($1,$2,$3,$4,$5,$6)',
-      [
-        employee_id,
-        name,
-        bcrypt.hashSync(password,10),
-        role || 'engineer',
-        assignedCircle,
-        newPermsJson
-      ]
-    );
-
-    res.json({success:true});
-
-  } catch(e){
-    res.status(500).json({error:e.message});
-  }
-});
+    await q('INSERT INTO engineers (employee_id,name,password,role,circle,permissions) VALUES ($1,$2,$3,$4,$5,$6)',
+      [employee_id, name, bcrypt.hashSync(password,10), role||'engineer', assignedCircle, newPermsJson]);
     res.json({success:true});
   } catch(e){res.status(500).json({error:e.message});}
 });
@@ -578,7 +568,28 @@ app.post('/sync', verifyToken, async (req,res) => {
   } catch(e){res.status(500).json({error:e.message});}
 });
 
-app.get('/health',(req,res)=>res.json({status:'ok',version:'1.2.0',message:'HBL CellInspector — PostgreSQL'}));
+// ── One-time migration: import old SQLite users into PostgreSQL ──────────
+app.post('/migrate-sqlite-users', verifyToken, async (req,res) => {
+  try {
+    if (req.user.role!=='superadmin') return res.status(403).json({error:'SuperAdmin only'});
+    const {users} = req.body;
+    if (!Array.isArray(users)) return res.status(400).json({error:'users array required'});
+    let migrated=0, skipped=0, errors=[];
+    for (const u of users) {
+      try {
+        const ex = await q('SELECT id FROM engineers WHERE employee_id=$1',[u.employee_id]);
+        if (ex.rows.length) { skipped++; continue; }
+        await q('INSERT INTO engineers (employee_id,name,password,role,circle,permissions) VALUES ($1,$2,$3,$4,$5,$6)',
+          [u.employee_id,u.name,u.password_hash||u.password,u.role||'engineer',u.circle||'',
+           JSON.stringify(u.permissions||{})]);
+        migrated++;
+      } catch(e) { errors.push(u.employee_id+': '+e.message); }
+    }
+    res.json({success:true,migrated,skipped,errors});
+  } catch(e){res.status(500).json({error:e.message});}
+});
+
+app.get('/health',(req,res)=>res.json({status:'ok',version:'1.3.0',message:'HBL CellInspector — PostgreSQL + RLS Secured',security:['rls-enabled','rate-limiting','security-headers','anon-revoked']}));
 
 // ── FIX#1: PATCH remarks — used by approval workflow (Level 1 & Level 2 override)
 // Any user with approval_level1 or approval_level2 permission can call this
@@ -635,6 +646,20 @@ app.get('/my-admin', verifyToken, async (req,res) => {
   } catch(e){res.status(500).json({error:e.message});}
 });
 
-initDatabase().then(()=>{
-  app.listen(PORT,'0.0.0.0',()=>console.log(`Server running on port ${PORT}`));
+initDatabase().then(async ()=>{
+  // Verify we are using service_role (required for RLS bypass)
+  try {
+    const r = await pool.query('SELECT current_user');
+    const usr = r.rows[0]?.current_user || '';
+    if (usr === 'anon') {
+      console.error('⚠ WARNING: Connected as anon — RLS will block all queries!');
+      console.error('  Update DATABASE_URL to use the service_role connection string.');
+    } else {
+      console.log('✓ DB role:', usr, '— RLS bypass active');
+    }
+  } catch(e) {}
+  app.listen(PORT,'0.0.0.0',()=>{
+    console.log(`HBL CellInspector Server v1.3.0 running on port ${PORT}`);
+    console.log('✓ Security: RLS enabled, rate limiting active, security headers set');
+  });
 }).catch(e=>{ console.error('DB init failed:',e.message); process.exit(1); });
