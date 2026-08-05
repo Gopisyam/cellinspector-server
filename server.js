@@ -312,16 +312,24 @@ app.get('/inspections', auth, async (req, res) => {
                    WHERE circle=$1 OR engineer_id=ANY($2::text[])
                    ORDER BY created_at DESC LIMIT $3 OFFSET $4`,
                    [circle || '', allIds, limit, offset])
-        : await q(`SELECT ${INS_COLS} FROM inspections WHERE circle=$1
-                   ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
-                   [circle || '', limit, offset]);
+        : (circle
+            ? await q(`SELECT ${INS_COLS} FROM inspections WHERE circle=$1
+                       ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
+                       [circle, limit, offset])
+            : await q(`SELECT ${INS_COLS} FROM inspections
+                       ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
+                       [limit, offset]));
       rows = r.rows;
 
     } else {
+      // Also search by engineer_name — old records may use name instead of ID
+      const engInfo = await q('SELECT name FROM engineers WHERE employee_id=$1', [employee_id]);
+      const engName = engInfo.rows[0]?.name || '';
       const r = await q(
-        `SELECT ${INS_COLS} FROM inspections WHERE engineer_id=$1
-         ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
-        [employee_id, limit, offset]
+        `SELECT ${INS_COLS} FROM inspections
+         WHERE engineer_id=$1 OR engineer_name=$2
+         ORDER BY created_at DESC LIMIT $3 OFFSET $4`,
+        [employee_id, engName, limit, offset]
       );
       rows = r.rows;
     }
@@ -541,6 +549,51 @@ app.get('/my-admin', auth, async (req, res) => {
        WHERE m.engineer_employee_id=$1`, [req.user.employee_id]
     );
     res.json(r.rows[0] || null);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── FIX OLD DATA (superadmin only — call once after migration) ────────────
+// Updates old records that have empty circle or mismatched engineer_id
+app.post('/fix-old-data', auth, async (req, res) => {
+  try {
+    if (req.user.role !== 'superadmin')
+      return res.status(403).json({ error: 'SuperAdmin only' });
+
+    let fixed = 0;
+
+    // Fix 1: Records with empty circle — set circle based on engineer's current circle
+    const emptyCircle = await q(
+      `SELECT DISTINCT engineer_id FROM inspections WHERE circle='' OR circle IS NULL`
+    );
+    for (const row of emptyCircle.rows) {
+      const eng = await q(
+        `SELECT circle FROM engineers WHERE employee_id=$1`, [row.engineer_id]
+      );
+      if (eng.rows[0]?.circle) {
+        await q(
+          `UPDATE inspections SET circle=$1 WHERE engineer_id=$2 AND (circle='' OR circle IS NULL)`,
+          [eng.rows[0].circle, row.engineer_id]
+        );
+        fixed++;
+      }
+    }
+
+    // Fix 2: Records where engineer_id matches engineer name instead of employee_id
+    const allEngs = await q(`SELECT employee_id, name FROM engineers`);
+    for (const eng of allEngs.rows) {
+      const byName = await q(
+        `SELECT COUNT(*) FROM inspections WHERE engineer_id=$1`, [eng.name]
+      );
+      if (parseInt(byName.rows[0].count) > 0) {
+        await q(
+          `UPDATE inspections SET engineer_id=$1 WHERE engineer_id=$2`,
+          [eng.employee_id, eng.name]
+        );
+        fixed += parseInt(byName.rows[0].count);
+      }
+    }
+
+    res.json({ success: true, fixed, message: `Fixed ${fixed} records` });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
