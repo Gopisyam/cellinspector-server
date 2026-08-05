@@ -408,6 +408,33 @@ app.get('/thresholds', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// Backward compat — old app calls /thresholds/VRLA
+app.get('/thresholds/:cell_type', auth, async (req, res) => {
+  try {
+    const r = await q('SELECT * FROM thresholds WHERE id=1');
+    res.json(r.rows[0] || {});
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/thresholds/:cell_type', auth, async (req, res) => {
+  try {
+    if (!['superadmin','admin'].includes(req.user.role))
+      return res.status(403).json({ error: 'Forbidden' });
+    const t = req.body;
+    await q(`UPDATE thresholds SET
+      float_voltage_min=$1, float_voltage_max=$2,
+      boost_voltage_min=$3, boost_voltage_max=$4,
+      lvbd_min=$5, dod_caution=$6, dod_deploy_bb=$7,
+      smps_efficiency=$8, float_tolerance=$9, boost_tolerance=$10,
+      updated_at=NOW() WHERE id=1`,
+      [t.float_voltage_min||2.20, t.float_voltage_max||2.30,
+       t.boost_voltage_min||2.28, t.boost_voltage_max||2.38,
+       t.lvbd_min||1.75, t.dod_caution||60, t.dod_deploy_bb||80,
+       t.smps_efficiency||0.90, t.float_tolerance||0.1, t.boost_tolerance||0.1]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.put('/thresholds', auth, async (req, res) => {
   try {
     if (!['superadmin','admin'].includes(req.user.role))
