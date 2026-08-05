@@ -123,6 +123,29 @@ async function initDB() {
     `ALTER TABLE thresholds ADD COLUMN IF NOT EXISTS boost_tolerance REAL DEFAULT 0.1`,
   ]) { try { await q(m); } catch {} }
 
+  // Drop NOT NULL on any legacy columns from old schema that block inserts
+  for (const col of ['cell_type','cell_make','cell_model','cell_capacity',
+                     'cell_voltage','manufacturer','location','remarks']) {
+    try {
+      await q(`ALTER TABLE thresholds ALTER COLUMN ${col} DROP NOT NULL`);
+    } catch {} // Column may not exist — safe to ignore
+  }
+
+  // Set defaults on all thresholds columns so INSERT without them works
+  try {
+    await q(`ALTER TABLE thresholds
+      ALTER COLUMN float_voltage_min  SET DEFAULT 2.20,
+      ALTER COLUMN float_voltage_max  SET DEFAULT 2.30,
+      ALTER COLUMN boost_voltage_min  SET DEFAULT 2.28,
+      ALTER COLUMN boost_voltage_max  SET DEFAULT 2.38,
+      ALTER COLUMN lvbd_min           SET DEFAULT 1.75,
+      ALTER COLUMN dod_caution        SET DEFAULT 60,
+      ALTER COLUMN dod_deploy_bb      SET DEFAULT 80,
+      ALTER COLUMN smps_efficiency    SET DEFAULT 0.90,
+      ALTER COLUMN float_tolerance    SET DEFAULT 0.1,
+      ALTER COLUMN boost_tolerance    SET DEFAULT 0.1`);
+  } catch (e) { console.log('Set defaults (non-fatal):', e.message); }
+
   // ── PURGE BASE64 FROM EXISTING DB RECORDS (one-time cleanup) ────────────
   // Old records may have MB of base64 photos in remarks — strip them now
   console.log('Cleaning base64 from existing records...');
@@ -144,7 +167,25 @@ async function initDB() {
     if (cleaned > 0) console.log(`Cleaned base64 from ${cleaned} records`);
   } catch (e) { console.log('Cleanup error (non-fatal):', e.message); }
 
-  await q(`INSERT INTO thresholds (id) VALUES (1) ON CONFLICT (id) DO NOTHING`);
+  // Insert default thresholds row — cover ALL possible columns to avoid NOT NULL errors
+  try {
+    await q(`INSERT INTO thresholds (id,float_voltage_min,float_voltage_max,
+      boost_voltage_min,boost_voltage_max,lvbd_min,dod_caution,dod_deploy_bb,
+      smps_efficiency,float_tolerance,boost_tolerance)
+      VALUES (1,2.20,2.30,2.28,2.38,1.75,60,80,0.90,0.1,0.1)
+      ON CONFLICT (id) DO NOTHING`);
+  } catch (e) {
+    console.log('Thresholds seed (non-fatal):', e.message);
+    // Fallback: update existing row instead
+    try {
+      await q(`UPDATE thresholds SET
+        float_voltage_min=2.20, float_voltage_max=2.30,
+        boost_voltage_min=2.28, boost_voltage_max=2.38,
+        lvbd_min=1.75, dod_caution=60, dod_deploy_bb=80,
+        smps_efficiency=0.90, float_tolerance=0.1, boost_tolerance=0.1
+        WHERE id=1`);
+    } catch {}
+  }
 
   // Default superadmin
   const sa = await q(`SELECT id FROM engineers WHERE employee_id='SUPERADMIN'`);
