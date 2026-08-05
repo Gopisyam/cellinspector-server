@@ -24,13 +24,36 @@ app.use(cors());
 app.use(express.json({ limit: '2mb' }));  // hard 2MB — photos must never be sent to server
 
 // ── DB POOL (max 3 — Render free tier) ────────────────────────────────────
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+// Parse connection string safely — handles special chars in password
+let poolConfig = {
   ssl: { rejectUnauthorized: false },
   max: 3,
   idleTimeoutMillis: 20000,
   connectionTimeoutMillis: 5000,
-});
+};
+
+const dbUrl = process.env.DATABASE_URL || '';
+if (dbUrl) {
+  try {
+    // Try using connectionString directly first
+    poolConfig.connectionString = dbUrl;
+    console.log('Using DATABASE_URL connection string');
+  } catch (e) {
+    console.log('URL parse error — trying individual params');
+  }
+} else {
+  // Fallback: individual params from env vars
+  poolConfig = {
+    ...poolConfig,
+    host:     process.env.PGHOST,
+    port:     parseInt(process.env.PGPORT) || 5432,
+    database: process.env.PGDATABASE || 'postgres',
+    user:     process.env.PGUSER     || 'postgres',
+    password: process.env.PGPASSWORD,
+  };
+}
+
+const pool = new Pool(poolConfig);
 const q = (sql, p) => pool.query(sql, p);
 
 // ── STRIP BASE64 FROM REMARKS AT THE SQL LEVEL ─────────────────────────────
