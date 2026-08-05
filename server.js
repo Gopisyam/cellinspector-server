@@ -545,6 +545,7 @@ app.get('/my-admin', auth, async (req, res) => {
 });
 
 // ── HEALTH ─────────────────────────────────────────────────────────────────
+// Public health check (no auth) — used to verify server is up
 app.get('/health', (req, res) => {
   const m = process.memoryUsage();
   res.json({
@@ -554,6 +555,12 @@ app.get('/health', (req, res) => {
     rss_mb: Math.round(m.rss / 1024 / 1024),
     uptime_min: Math.round(process.uptime() / 60),
   });
+});
+
+// Authenticated health check — App uses this to validate stored JWT token on startup
+// If token is valid: 200. If token is expired/wrong secret: 401 → app clears and re-logs in.
+app.get('/validate-token', auth, (req, res) => {
+  res.json({ valid: true, user: req.user.employee_id, role: req.user.role });
 });
 
 // ── START ──────────────────────────────────────────────────────────────────
