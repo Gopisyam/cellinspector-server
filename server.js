@@ -272,8 +272,10 @@ app.post('/inspections', auth, async (req, res) => {
 app.get('/inspections', auth, async (req, res) => {
   try {
     const { role, employee_id, circle } = req.user;
-    const limit  = Math.min(100, parseInt(req.query.limit)  || 50);
-    const offset = Math.max(0,   parseInt(req.query.offset) || 0);
+    // SuperAdmin gets up to 500 records, others get up to 100
+    const maxLimit = (req.user?.role === 'superadmin') ? 500 : 100;
+    const limit  = Math.min(maxLimit, parseInt(req.query.limit) || maxLimit);
+    const offset = Math.max(0, parseInt(req.query.offset) || 0);
     let rows = [];
 
     if (role === 'superadmin') {
@@ -594,6 +596,49 @@ app.post('/fix-old-data', auth, async (req, res) => {
     }
 
     res.json({ success: true, fixed, message: `Fixed ${fixed} records` });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── SUMMARY (backward compat — computes from inspections table) ───────────
+app.get('/summary', auth, async (req, res) => {
+  try {
+    const { role, employee_id, circle } = req.user;
+    let r;
+    if (role === 'superadmin') {
+      r = await q(`SELECT decision, COUNT(*) FROM inspections GROUP BY decision`);
+    } else if (role === 'admin') {
+      r = await q(`SELECT decision, COUNT(*) FROM inspections WHERE circle=$1 GROUP BY decision`, [circle||'']);
+    } else {
+      r = await q(`SELECT decision, COUNT(*) FROM inspections WHERE engineer_id=$1 GROUP BY decision`, [employee_id]);
+    }
+    const summary = { ACCEPT: 0, REJECT: 0, REPLACE: 0 };
+    r.rows.forEach(row => { if (summary[row.decision] !== undefined) summary[row.decision] = parseInt(row.count); });
+    res.json(summary);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── DEBUG (superadmin only — check raw DB state) ──────────────────────────
+app.get('/debug', auth, async (req, res) => {
+  try {
+    if (req.user.role !== 'superadmin')
+      return res.status(403).json({ error: 'SuperAdmin only' });
+
+    const total     = await q('SELECT COUNT(*) FROM inspections');
+    const withCircle= await q("SELECT COUNT(*) FROM inspections WHERE circle != '' AND circle IS NOT NULL");
+    const noCircle  = await q("SELECT COUNT(*) FROM inspections WHERE circle = '' OR circle IS NULL");
+    const sample    = await q('SELECT id, cell_id, engineer_id, engineer_name, circle, decision, created_at FROM inspections ORDER BY created_at DESC LIMIT 10');
+    const engineers = await q('SELECT employee_id, name, role, circle FROM engineers ORDER BY role');
+    const mem       = process.memoryUsage();
+
+    res.json({
+      total_records:      parseInt(total.rows[0].count),
+      records_with_circle:parseInt(withCircle.rows[0].count),
+      records_no_circle:  parseInt(noCircle.rows[0].count),
+      latest_10_records:  sample.rows,
+      engineers:          engineers.rows,
+      memory_mb:          Math.round(mem.heapUsed / 1024 / 1024),
+      server_version:     '1.3.1',
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
