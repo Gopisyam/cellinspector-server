@@ -24,36 +24,21 @@ app.use(cors());
 app.use(express.json({ limit: '2mb' }));  // hard 2MB — photos must never be sent to server
 
 // ── DB POOL (max 3 — Render free tier) ────────────────────────────────────
-// Parse connection string safely — handles special chars in password
-let poolConfig = {
-  ssl: { rejectUnauthorized: false },
-  max: 3,
-  idleTimeoutMillis: 20000,
-  connectionTimeoutMillis: 5000,
-};
-
-const dbUrl = process.env.DATABASE_URL || '';
-if (dbUrl) {
-  try {
-    // Try using connectionString directly first
-    poolConfig.connectionString = dbUrl;
-    console.log('Using DATABASE_URL connection string');
-  } catch (e) {
-    console.log('URL parse error — trying individual params');
-  }
-} else {
-  // Fallback: individual params from env vars
-  poolConfig = {
-    ...poolConfig,
-    host:     process.env.PGHOST,
-    port:     parseInt(process.env.PGPORT) || 5432,
-    database: process.env.PGDATABASE || 'postgres',
-    user:     process.env.PGUSER     || 'postgres',
-    password: process.env.PGPASSWORD,
-  };
-}
-
-const pool = new Pool(poolConfig);
+// Always use individual params — avoids URL encoding issues and forces IPv4
+// Set PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD in Render environment
+const pool = new Pool({
+  host:     process.env.PGHOST,
+  port:     parseInt(process.env.PGPORT) || 5432,
+  database: process.env.PGDATABASE || 'postgres',
+  user:     process.env.PGUSER     || 'postgres',
+  password: process.env.PGPASSWORD,
+  ssl:      { rejectUnauthorized: false },
+  max:      3,
+  idleTimeoutMillis:    20000,
+  connectionTimeoutMillis: 10000,
+  family:   4,  // Force IPv4 — Render free tier does not support IPv6
+});
+console.log('DB connecting to:', process.env.PGHOST, 'port:', process.env.PGPORT || 5432);
 const q = (sql, p) => pool.query(sql, p);
 
 // ── STRIP BASE64 FROM REMARKS AT THE SQL LEVEL ─────────────────────────────
